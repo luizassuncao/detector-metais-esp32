@@ -1,0 +1,181 @@
+#include <Adafruit_GFX.h>    
+#include <Adafruit_ST7789.h> 
+#include <SPI.h>
+#include <math.h>
+
+#define TFT_CS    5
+#define TFT_DC    16
+#define TFT_RST   23
+
+#define PIN_TX    25  
+#define PIN_RX    34  
+#define PIN_BUZZER 26  
+#define PIN_BOTAO_SOLO 0  // Botão BOOT integrado
+
+// Novos pinos para controle de Sensibilidade Digital
+#define PIN_SENS_UP   27  // Botão para Aumentar Sensibilidade
+#define PIN_SENS_DOWN 14  // Botão para Diminuir Sensibilidade
+
+const int pwmFreq = 15000;     
+const int pwmChannel = 0;      
+const int pwmResolution = 8;   
+const int pwmDuty = 127;       
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+const int AMOSTRAS_POR_CICLO = 8; 
+float tabelaSeno[AMOSTRAS_POR_CICLO];
+float tabelaCosseno[AMOSTRAS_POR_CICLO];
+
+float anguloFaseSolo = 0.0; 
+bool soloCalibrado = false;
+
+// Controle de Sensibilidade Digital (Nível de 1 a 10)
+int nivelSensibilidade = 7; 
+float thresholdBase = 40.0; // Limiar calculado dinamicamente
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(PIN_BUZZER, OUTPUT); 
+  pinMode(PIN_BOTAO_SOLO, INPUT_PULLUP);
+  
+  // Configura os botões de sensibilidade com resistores pull-up internos
+  pinMode(PIN_SENS_UP, INPUT_PULLUP);
+  pinMode(PIN_SENS_DOWN, INPUT_PULLUP);
+
+  tft.init(135, 240); 
+  tft.setRotation(1); 
+  tft.fillScreen(ST77XX_BLACK);
+  
+  ledcSetup(pwmChannel, pwmFreq, pwmResolution);
+  ledcAttachPin(PIN_TX, pwmChannel);
+  ledcWrite(pwmChannel, pwmDuty); 
+
+  for (int i = 0; i < AMOSTRAS_POR_CICLO; i++) {
+    float angulo = (2.0 * M_PI * i) / AMOSTRAS_POR_CICLO;
+    tabelaSeno[i] = sin(angulo);
+    tabelaCosseno[i] = cos(angulo);
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("Sensibilidade Digital");
+  delay(1000);
+  tft.fillScreen(ST77XX_BLACK);
+}
+
+void loop() {
+  // 1. Verificação e Leitura dos Botões de Sensibilidade (Ajuste Digital)
+  if (digitalRead(PIN_SENS_UP) == LOW) {
+    if (nivelSensibilidade < 10) {
+      nivelSensibilidade++;
+      tone(PIN_BUZZER, 2000, 50); // Bipe rápido de confirmação de clique
+      delay(200); // Debounce simples
+    }
+  }
+  
+  if (digitalRead(PIN_SENS_DOWN) == LOW) {
+    if (nivelSensibilidade > 1) {
+      nivelSensibilidade--;
+      tone(PIN_BUZZER, 1000, 50); // Bipe mais grave de confirmação
+      delay(200); 
+    }
+  }
+
+  // Equação que converte o nível 1-10 em limiar matemático invertido:
+  // Nível 10 (Mais sensível) -> Corta sinais abaixo de 15 (Ouve quase tudo, inclusive ruído)
+  // Nível 1 (Menos sensível) -> Corta sinais abaixo de 150 (Fica muito estável, mas perde alcance)
+  thresholdBase = map(nivelSensibilidade, 1, 10, 150, 15);
+
+  // 2. Amostragem Digital síncrona
+  long somaI = 0; long somaQ = 0;
+  for (int j = 0; j < 50; j++) { 
+    for (int i = 0; i < AMOSTRAS_POR_CICLO; i++) {
+      int sinalBruto = analogRead(PIN_RX) - 2048; 
+      somaI += sinalBruto * tabelaSeno[i];
+      somaQ += sinalBruto * tabelaCosseno[i];
+    }
+  }
+
+  float componenteI = (float)somaI / 400.0;
+  float componenteQ = (float)somaQ / 400.0;
+
+  // Rotina de Balanço de Solo (Botão BOOT)
+  if (digitalRead(PIN_BOTAO_SOLO) == LOW) {
+    tft.fillScreen(ST77XX_RED);
+    tft.setCursor(10, 40); tft.setTextSize(2); tft.setTextColor(ST77XX_WHITE);
+    tft.println("CALIBRANDO SOLO...");
+    delay(500); 
+    anguloFaseSolo = atan2(componenteQ, componenteI);
+    soloCalibrado = true;
+    tft.fillScreen(ST77XX_BLACK);
+  }
+
+  // Aplicação da Matriz de Rotação para Filtro de Solo
+  float I_Filtrado = componenteI * cos(-anguloFaseSolo) - componenteQ * sin(-anguloFaseSolo);
+  float Q_Filtrado = componenteI * sin(-anguloFaseSolo) + componenteQ * cos(-anguloFaseSolo);
+
+  float magnitudeMetais = sqrt((I_Filtrado * I_Filtrado) + (Q_Filtrado * Q_Filtrado));
+
+  // 3. Renderização Condicional da Interface Visual
+  if (magnitudeMetais > thresholdBase) { 
+    float anguloFinalRad = atan2(Q_Filtrado, I_Filtrado);
+    int faseGraus = anguloFinalRad * (180.0 / M_PI);
+
+    tft.fillRect(0, 0, 240, 95, ST77XX_BLACK); // Limpa apenas a parte de cima dos dados
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print("VDI: "); tft.println(faseGraus);
+
+    tft.setCursor(10, 45);
+    if (faseGraus >= -180 && faseGraus < -35) {
+      tft.setTextColor(ST77XX_RED); tft.setTextSize(3); tft.println("FERRO");
+      tone(PIN_BUZZER, 180, 80); 
+    } 
+    else if (faseGraus >= -35 && faseGraus < 20) {
+      tft.setTextColor(ST77XX_ORANGE); tft.setTextSize(3); tft.println("OURO / ALUM");
+      tone(PIN_BUZZER, 587, 100); 
+    } 
+    else if (faseGraus >= 20 && faseGraus < 70) {
+      tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(3); tft.println("BRONZE / MOEDA");
+      tone(PIN_BUZZER, 880, 100); 
+    } 
+    else if (faseGraus >= 70 && faseGraus <= 180) {
+      tft.setTextColor(ST77XX_GREEN); tft.setTextSize(3); tft.println("PRATA PURA");
+      tone(PIN_BUZZER, 1318, 100); 
+    }
+    delay(100); 
+  } else {
+    noTone(PIN_BUZZER); 
+    tft.fillRect(0, 0, 240, 95, ST77XX_BLACK);
+    tft.setCursor(10, 10);
+    tft.setTextSize(2);
+    tft.setTextColor(soloCalibrado ? ST77XX_GREEN : ST77XX_DARKGREY);
+    tft.println(soloCalibrado ? "SOLO: OK" : "SOLO: PADRAO");
+    
+    tft.setCursor(10, 45);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.println("AGUARDANDO ALVO...");
+  }
+
+  // 4. Painel de Status Fixo no Rodapé (Exibe a Sensibilidade e Intensidade)
+  tft.drawFastHLine(0, 100, 240, ST77XX_DARKGREY);
+  
+  // Apaga apenas o número antigo da sensibilidade para não piscar
+  tft.fillRect(10, 110, 100, 20, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(10, 115);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("SENS: "); tft.print(nivelSensibilidade); tft.print("/10");
+
+  // Barra de sinal dinâmica proporcional ao Threshold configurado
+  int barraMag = map(constrain(magnitudeMetais, 0, 800), 0, 800, 0, 100);
+  tft.fillRect(130, 115, 100, 10, ST77XX_BLACK); // Limpa barra
+  tft.fillRect(130, 115, barraMag, 10, ST77XX_BLUE);
+  tft.drawRect(130, 115, 100, 10, ST77XX_WHITE);
+
+  delay(30);
+}
